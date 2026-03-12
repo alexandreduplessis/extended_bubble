@@ -52,6 +52,7 @@ class BubbleDataset(Dataset):
         min_constraints: int = 10,
         max_constraints: int = 200,
         augment: bool = True,
+        cache_dir: Optional[str] = None,
     ) -> None:
         super().__init__()
         self.msd_path = msd_path
@@ -62,31 +63,53 @@ class BubbleDataset(Dataset):
         self.max_constraints = max_constraints
         self.augment = augment and (split == "train")
 
-        graph_dir = os.path.join(
-            msd_path, "modified-swiss-dwellings-v2", split, "graph_out"
-        )
-        self.struct_dir = os.path.join(
-            msd_path, "modified-swiss-dwellings-v2", split, "struct_in"
-        )
+        # Check for preprocessed cache
+        if cache_dir is None:
+            cache_dir = os.path.join(os.path.dirname(msd_path), "msd_preprocessed")
+        cache_split = os.path.join(cache_dir, split)
+        self.cache_files = sorted(glob.glob(os.path.join(cache_split, "*.npz")))
+        self.use_cache = len(self.cache_files) > 0
 
-        self.graph_files = sorted(glob.glob(os.path.join(graph_dir, "*.pickle")))
-        if len(self.graph_files) == 0:
-            raise FileNotFoundError(
-                f"No pickle files found in {graph_dir}"
+        if self.use_cache:
+            # Use preprocessed files
+            self.graph_files = self.cache_files  # reuse for __len__
+        else:
+            graph_dir = os.path.join(
+                msd_path, "modified-swiss-dwellings-v2", split, "graph_out"
             )
+            self.struct_dir = os.path.join(
+                msd_path, "modified-swiss-dwellings-v2", split, "struct_in"
+            )
+
+            self.graph_files = sorted(glob.glob(os.path.join(graph_dir, "*.pickle")))
+            if len(self.graph_files) == 0:
+                raise FileNotFoundError(
+                    f"No pickle files found in {graph_dir}"
+                )
 
     def __len__(self) -> int:
         return len(self.graph_files)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        # --- Load graph and extract bubbles ---
+        if self.use_cache:
+            return self._getitem_cached(idx)
+        return self._getitem_raw(idx)
+
+    def _getitem_cached(self, idx: int) -> Dict[str, torch.Tensor]:
+        data = np.load(self.cache_files[idx])
+        cx, cy, radii, types = data["cx"], data["cy"], data["radii"], data["types"]
+        boundary = data["boundary"]
+
+        bubbles = list(zip(cx.tolist(), cy.tolist(), radii.tolist(), types.tolist()))
+        return self._build_tensors(bubbles, boundary, normalize=True)
+
+    def _getitem_raw(self, idx: int) -> Dict[str, torch.Tensor]:
         graph_path = self.graph_files[idx]
         with open(graph_path, "rb") as f:
             G = pickle.load(f)
 
         bubbles = extract_bubbles(G)
 
-        # --- Load boundary ---
         base_name = os.path.splitext(os.path.basename(graph_path))[0]
         struct_path = os.path.join(self.struct_dir, base_name + ".npy")
         if os.path.exists(struct_path):
@@ -95,14 +118,22 @@ class BubbleDataset(Dataset):
         else:
             boundary = self._boundary_from_rooms(G)
 
-        # --- Normalize to [0, 1] ---
-        bubbles, boundary = self._normalize(bubbles, boundary)
+        return self._build_tensors(bubbles, boundary, normalize=True)
 
-        # --- Augment ---
+    def _build_tensors(
+        self,
+        bubbles: List[Tuple[float, float, float, int]],
+        boundary: np.ndarray,
+        normalize: bool = False,
+    ) -> Dict[str, torch.Tensor]:
+        """Shared logic: normalize, augment, generate constraints, build tensors."""
+        if normalize:
+            bubbles, boundary = self._normalize(bubbles, boundary)
+
         if self.augment:
             bubbles, boundary = self._augment(bubbles, boundary)
 
-        # --- Generate constraints ---
+        # Generate constraints (random subset each time)
         n_constraints = np.random.randint(
             self.min_constraints, self.max_constraints + 1
         )
@@ -110,7 +141,7 @@ class BubbleDataset(Dataset):
             bubbles, boundary, n_sample=n_constraints
         )
 
-        # --- Build bubble tensor (n_max, 13) ---
+        # Build bubble tensor (n_max, 13)
         n_bubbles = min(len(bubbles), self.n_max)
         bubble_tensor = torch.zeros(self.n_max, SLOT_DIM, dtype=torch.float32)
         bubble_mask = torch.zeros(self.n_max, dtype=torch.bool)
@@ -126,7 +157,7 @@ class BubbleDataset(Dataset):
                 bubble_tensor[i, 3 + NUM_ROOM_TYPES] = 1.0  # empty slot
             bubble_mask[i] = True
 
-        # --- Build boundary tensor (n_boundary_max, 2) ---
+        # Build boundary tensor (n_boundary_max, 2)
         n_bnd = min(len(boundary), self.n_boundary_max)
         boundary_tensor = torch.zeros(
             self.n_boundary_max, 2, dtype=torch.float32
@@ -139,7 +170,7 @@ class BubbleDataset(Dataset):
             )
             boundary_mask[:n_bnd] = True
 
-        # --- Build constraint tensor (max_constraints, CONSTRAINT_DIM) ---
+        # Build constraint tensor (max_constraints, CONSTRAINT_DIM)
         n_con = min(len(constraints_list), self.max_constraints)
         constraint_tensor = torch.zeros(
             self.max_constraints, CONSTRAINT_DIM, dtype=torch.float32

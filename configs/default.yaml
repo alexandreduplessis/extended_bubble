@@ -23,7 +23,7 @@ model:
 diffusion:
   num_timesteps: 1000
   schedule: cosine
-  type_schedule_shift: 0.3
+  type_schedule_shift: 1.0
   prediction: epsilon
 
 training:
@@ -32,7 +32,7 @@ training:
   warmup_steps: 1000
   max_steps: 200000
   val_every: 5000
-  save_every: 10000
+  save_every: 50
   cfg_drop_single: 0.1
   cfg_drop_all: 0.05
   cfg_drop_boundary: 0.02

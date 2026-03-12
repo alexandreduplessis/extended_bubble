@@ -119,15 +119,23 @@ class AdaLNCrossAttentionBlock(nn.Module):
             shift_ffn, scale_ffn, gate_ffn,
         ) = mod.chunk(12, dim=-1)
 
-        # Helper: convert 1=valid masks to True=ignore for MHA key_padding_mask
-        def invert_mask(mask):
+        # Convert 1=valid masks to True=ignore for MHA key_padding_mask.
+        # When ALL keys are masked for a sample (e.g. after CFG dropout),
+        # softmax(-inf, ..., -inf) = NaN. Fix: unmask one dummy (zero-padded)
+        # token so softmax stays finite. The attention output ≈ 0 (correct).
+        def safe_kpm(mask):
             if mask is None:
                 return None
-            return mask == 0  # True where padded → ignored
+            kpm = mask == 0  # True where padded → ignored by MHA
+            all_masked = kpm.all(dim=-1)  # (B,)
+            if all_masked.any():
+                kpm = kpm.clone()
+                kpm[all_masked, 0] = False  # unmask one dummy token
+            return kpm
 
-        bubble_kpm = invert_mask(bubble_mask)
-        boundary_kpm = invert_mask(boundary_mask)
-        constraint_kpm = invert_mask(constraint_mask)
+        bubble_kpm = safe_kpm(bubble_mask)
+        boundary_kpm = safe_kpm(boundary_mask)
+        constraint_kpm = safe_kpm(constraint_mask)
 
         # 1. Self-attention
         h = modulate(self.norm_sa(x), shift_sa, scale_sa)

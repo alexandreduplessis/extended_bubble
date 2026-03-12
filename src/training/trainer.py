@@ -1,15 +1,20 @@
 """Training loop for bubble diffusion."""
 import math
+import time
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from pathlib import Path
 import logging
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Tuple
+
+import wandb
 
 from src.model.diffusion import GaussianDiffusion
 from src.model.transformer import BubbleDenoiser
 from src.data.dataset import BubbleDataset, collate_bubbles
+from src.inference.sampler import BubbleSampler
+from src.evaluation.visualize import plot_bubbles
 
 logger = logging.getLogger(__name__)
 
@@ -78,10 +83,12 @@ class BubbleTrainer:
             self.train_dataset,
             batch_size=tc["batch_size"],
             shuffle=True,
-            num_workers=4,
+            num_workers=8,
             collate_fn=collate_bubbles,
             pin_memory=True,
             drop_last=True,
+            persistent_workers=True,
+            prefetch_factor=4,
         )
 
         n_params = sum(p.numel() for p in self.model.parameters())
@@ -184,14 +191,73 @@ class BubbleTrainer:
             "lr": lr,
         }
 
+    @torch.no_grad()
+    def _generate_samples(self, step: int, save_dir: Path, n_samples: int = 4):
+        """Generate and save sample bubble diagrams for visual monitoring."""
+        self.model.eval()
+        sampler = BubbleSampler(
+            self.model, self.diffusion,
+            num_room_types=self.config["data"]["num_room_types"],
+        )
+
+        # Grab a real batch for conditioning context
+        try:
+            batch = next(iter(self.train_loader))
+        except StopIteration:
+            return
+
+        sample_dir = save_dir / "samples"
+        sample_dir.mkdir(exist_ok=True)
+
+        images = []
+        for i in range(min(n_samples, batch["boundary"].shape[0])):
+            boundary = batch["boundary"][i:i+1].to(self.device)
+            boundary_mask = batch["boundary_mask"][i:i+1].to(self.device).float()
+            constraints = batch["constraints"][i:i+1].to(self.device)
+            constraint_mask = batch["constraint_mask"][i:i+1].to(self.device).float()
+
+            bubbles = sampler.sample(
+                boundary, boundary_mask, constraints, constraint_mask,
+                n_slots=self.config["data"]["n_max"],
+                num_steps=50,  # fewer steps for speed
+                cfg_scale=self.config["inference"]["cfg_scale"],
+            )
+
+            bnd_np = boundary[0].cpu().numpy()
+            valid = boundary_mask[0].cpu().numpy() > 0.5
+            bnd_np = bnd_np[valid]
+
+            img_path = str(sample_dir / f"step_{step}_sample_{i}.png")
+            plot_bubbles(
+                bubbles, boundary=bnd_np,
+                title=f"Step {step} — {len(bubbles)} rooms",
+                save_path=img_path,
+            )
+            images.append(wandb.Image(img_path, caption=f"Sample {i} ({len(bubbles)} rooms)"))
+
+        if images:
+            wandb.log({"samples": images}, step=step)
+
+        self.model.train()
+
     def train(self):
         """Main training loop up to max_steps."""
         logger.info(f"Starting training for {self.max_steps} steps")
         tc = self.config["training"]
-        save_dir = Path("checkpoints")
+        save_dir = Path("/Data/amine.chraibi/checkpoints")
         save_dir.mkdir(exist_ok=True)
 
+        # Wandb init
+        wandb.init(
+            project="extendedbubble",
+            config=self.config,
+            name=f"run-{self.max_steps}steps",
+        )
+        wandb.watch(self.model, log="gradients", log_freq=500)
+
+        sample_every = tc.get("sample_every", 5000)
         data_iter = iter(self.train_loader)
+        step_start = time.time()
 
         for step in range(self.max_steps):
             try:
@@ -202,18 +268,33 @@ class BubbleTrainer:
 
             metrics = self.train_step(batch)
 
-            if step % 100 == 0:
-                logger.info(
-                    f"Step {step}: loss={metrics['loss']:.4f} "
-                    f"geom={metrics['geom_loss']:.4f} "
-                    f"type={metrics['type_loss']:.4f} "
-                    f"lr={metrics['lr']:.6f}"
-                )
+            # Log every step to wandb, print every step to console
+            step_time = time.time() - step_start
+            metrics["step_time"] = step_time
+            wandb.log(metrics, step=step)
+
+            logger.info(
+                f"Step {step}: loss={metrics['loss']:.4f} "
+                f"geom={metrics['geom_loss']:.4f} "
+                f"type={metrics['type_loss']:.4f} "
+                f"lr={metrics['lr']:.6f} "
+                f"dt={step_time:.2f}s"
+            )
+            step_start = time.time()
 
             if step > 0 and step % tc["save_every"] == 0:
                 ckpt_path = save_dir / f"checkpoint_{step}.pt"
                 self.save(str(ckpt_path))
                 logger.info(f"Saved checkpoint at step {step}")
+
+            if step > 0 and step % sample_every == 0:
+                logger.info(f"Generating samples at step {step}...")
+                self._generate_samples(step, save_dir)
+
+        # Final save and samples
+        self.save(str(save_dir / "checkpoint_final.pt"))
+        self._generate_samples(self.max_steps, save_dir)
+        wandb.finish()
 
     def save(self, path: str):
         """Save checkpoint to disk."""
