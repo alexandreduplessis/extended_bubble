@@ -1,0 +1,11 @@
+torch>=2.5.0
+torchvision>=0.20.0
+numpy>=2.0
+scipy>=1.13
+shapely>=2.0
+networkx>=3.2
+matplotlib>=3.9
+PyYAML>=6.0
+wandb>=0.25
+kaggle>=1.7
+tqdm>=4.67

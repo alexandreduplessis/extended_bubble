@@ -244,7 +244,7 @@ class BubbleTrainer:
         """Main training loop up to max_steps."""
         logger.info(f"Starting training for {self.max_steps} steps")
         tc = self.config["training"]
-        save_dir = Path("/Data/amine.chraibi/checkpoints")
+        save_dir = Path(tc.get("checkpoint_dir", "/Data/amine.chraibi/checkpoints"))
         save_dir.mkdir(exist_ok=True)
 
         # Wandb init

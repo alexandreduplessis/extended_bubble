@@ -27,7 +27,7 @@ diffusion:
   prediction: epsilon
 
 training:
-  batch_size: 32
+  batch_size: 128
   lr: 1.0e-4
   warmup_steps: 1000
   max_steps: 200000

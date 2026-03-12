@@ -65,8 +65,8 @@ def preprocess_split(msd_path: str, split: str, out_dir: str):
 
 
 if __name__ == "__main__":
-    msd_path = "/Data/amine.chraibi/msd"
-    out_dir = "/Data/amine.chraibi/msd_preprocessed"
+    msd_path = sys.argv[1] if len(sys.argv) > 1 else "/Data/amine.chraibi/msd"
+    out_dir = sys.argv[2] if len(sys.argv) > 2 else os.path.join(os.path.dirname(msd_path), "msd_preprocessed")
     os.makedirs(out_dir, exist_ok=True)
 
     preprocess_split(msd_path, "train", out_dir)
