@@ -1,0 +1,48 @@
+data:
+  msd_path: /Data/amine.chraibi/msd
+  n_max: 200
+  n_boundary_max: 64
+  n_constraints_max: 300
+  num_room_types: 9
+  num_constraint_types: 11
+  constraint_dim: 30
+  augment_rotations: true
+  augment_flips: true
+  min_constraints: 10
+  max_constraints: 200
+
+model:
+  d_model: 256
+  n_layers: 8
+  n_heads: 8
+  type_emb_dim: 8
+  slot_dim: 11
+  ffn_ratio: 4
+  dropout: 0.0
+
+diffusion:
+  num_timesteps: 1000
+  schedule: cosine
+  type_schedule_shift: 0.3
+  prediction: epsilon
+
+training:
+  batch_size: 32
+  lr: 1.0e-4
+  warmup_steps: 1000
+  max_steps: 200000
+  val_every: 5000
+  save_every: 10000
+  cfg_drop_single: 0.1
+  cfg_drop_all: 0.05
+  cfg_drop_boundary: 0.02
+  type_loss_weight: 2.0
+  grad_clip: 1.0
+
+inference:
+  num_steps: 100
+  cfg_scale: 3.0
+  energy_guidance_lambda: 0.0
+
+eval:
+  num_samples: 500

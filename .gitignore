@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.egg-info/
+.eggs/
+dist/
+build/
+*.so
+.env
+wandb/
+checkpoints/
+*.ckpt
+*.pt
