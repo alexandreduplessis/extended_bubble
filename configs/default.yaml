@@ -1,6 +1,6 @@
 data:
   msd_path: /Data/amine.chraibi/msd
-  n_max: 200
+  n_max: 135
   n_boundary_max: 64
   n_constraints_max: 300
   num_room_types: 9

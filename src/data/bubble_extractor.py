@@ -19,14 +19,16 @@ def extract_bubbles(
 
     For every node whose ``room_type`` is in 0..8 (i.e. excluding
     Structure=9 and Background=13), compute a bubble defined by the
-    centroid of its Shapely geometry and an equivalent radius
-    ``r = sqrt(area / pi)``.
+    centroid and an equivalent radius ``r = sqrt(area / pi)``.
+
+    Handles both MSD v1 (shapely Polygon geometry, tuple centroid) and
+    MSD v2 (list-of-tuples geometry, torch.Tensor centroid) formats.
 
     Parameters
     ----------
     graph : nx.Graph
         An MSD graph where each node carries ``room_type`` (int),
-        ``centroid`` (tuple), and ``geometry`` (shapely Polygon) attributes.
+        ``centroid``, and ``geometry`` attributes.
 
     Returns
     -------
@@ -37,11 +39,34 @@ def extract_bubbles(
         room_type: int = data["room_type"]
         if room_type not in _VALID_ROOM_TYPES:
             continue
-        geom: Polygon = data["geometry"]
-        centroid = geom.centroid
-        area = geom.area
+
+        geom = data["geometry"]
+        centroid_raw = data.get("centroid")
+
+        # Handle geometry: could be shapely Polygon or list of (x,y) tuples
+        if isinstance(geom, Polygon):
+            area = geom.area
+            cx, cy = geom.centroid.x, geom.centroid.y
+        elif isinstance(geom, (list, tuple)) and len(geom) >= 3:
+            poly = Polygon(geom)
+            if not poly.is_valid or poly.area <= 0:
+                continue
+            area = poly.area
+            cx, cy = poly.centroid.x, poly.centroid.y
+        else:
+            continue
+
+        # Override centroid if provided (MSD v2 stores it as torch.Tensor)
+        if centroid_raw is not None:
+            try:
+                # torch.Tensor or numpy array
+                cx = float(centroid_raw[0])
+                cy = float(centroid_raw[1])
+            except (IndexError, TypeError):
+                pass
+
         radius = math.sqrt(area / math.pi)
-        bubbles.append((centroid.x, centroid.y, radius, room_type))
+        bubbles.append((cx, cy, radius, room_type))
     return bubbles
 
 
