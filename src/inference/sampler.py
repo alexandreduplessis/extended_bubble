@@ -24,7 +24,6 @@ class BubbleSampler:
         # type one-hot has num_room_types + 1 dims (last is "empty")
         self.num_type_dims = num_room_types + 1
 
-    @torch.no_grad()
     def sample(
         self,
         boundary: torch.Tensor,
@@ -36,6 +35,7 @@ class BubbleSampler:
         cfg_scale: float = 3.0,
         energy_fns: Optional[List[Callable]] = None,
         energy_lambda: float = 0.01,
+        max_rooms: Optional[int] = None,
     ) -> List[Tuple[float, float, float, int]]:
         """Sample bubble diagrams using DDIM with classifier-free guidance.
 
@@ -79,27 +79,49 @@ class BubbleSampler:
         # Start from pure noise
         xt = torch.randn(B, n_slots, slot_dim, device=self.device)
 
+        # Build empty one-hot vector for clamping inactive slots
+        empty_onehot = torch.zeros(type_dims, device=self.device)
+        empty_onehot[-1] = 1.0  # last dim = "empty"
+
+        # Which slots are active (decided after first step if max_rooms set)
+        active_mask = None  # (n_slots,) bool, None = all active
+        selection_step = max(1, len(timesteps) // 10)  # select after 10% of steps
+
         for i, t_val in enumerate(timesteps):
             t = torch.full((B,), t_val, device=self.device, dtype=torch.long)
 
-            # Conditional prediction
-            pred_noise_cond = self.model(
-                xt, t, boundary, boundary_mask, constraints, constraint_mask, bubble_mask
-            )
+            with torch.no_grad():
+                # Conditional prediction
+                pred_noise_cond = self.model(
+                    xt, t, boundary, boundary_mask, constraints, constraint_mask, bubble_mask
+                )
 
-            # Unconditional prediction (zeroed constraint_mask)
-            pred_noise_uncond = self.model(
-                xt, t, boundary, boundary_mask, constraints, null_constraint_mask, bubble_mask
-            )
+                # Unconditional prediction (zeroed constraint_mask)
+                pred_noise_uncond = self.model(
+                    xt, t, boundary, boundary_mask, constraints, null_constraint_mask, bubble_mask
+                )
 
-            # CFG combination
-            pred_noise = pred_noise_uncond + cfg_scale * (pred_noise_cond - pred_noise_uncond)
+                # CFG combination
+                pred_noise = pred_noise_uncond + cfg_scale * (pred_noise_cond - pred_noise_uncond)
 
-            # Predict x0
-            x0_pred = self.diffusion.predict_x0_from_noise(xt, t, pred_noise)
+                # Predict x0
+                x0_pred = self.diffusion.predict_x0_from_noise(xt, t, pred_noise)
 
-            # Optional energy guidance
-            if energy_fns:
+            # After selection_step: pick top max_rooms slots, force rest to empty
+            if max_rooms is not None and i == selection_step and active_mask is None:
+                x0_type_cur = x0_pred[0, :, geom_dims:]  # (n_slots, type_dims)
+                non_empty_score = x0_type_cur[:, :-1].max(dim=-1).values - x0_type_cur[:, -1]
+                _, top_idx = torch.topk(non_empty_score, min(max_rooms, n_slots))
+                active_mask = torch.zeros(n_slots, device=self.device, dtype=torch.bool)
+                active_mask[top_idx] = True
+
+            # Clamp inactive slots to empty type
+            if active_mask is not None:
+                inactive = ~active_mask  # (n_slots,)
+                x0_pred[0, inactive, geom_dims:] = empty_onehot
+
+            # Optional energy guidance (needs gradients)
+            if energy_fns and energy_lambda > 0:
                 x0_guided = x0_pred.detach().clone().requires_grad_(True)
                 total_energy = sum(fn(x0_guided) for fn in energy_fns)
                 grad = torch.autograd.grad(total_energy, x0_guided)[0]
@@ -133,6 +155,16 @@ class BubbleSampler:
 
             xt_prev_type = sqrt_abar_prev_tp * x0_type + dir_xt_tp * noise_type
 
+            # Force inactive slots to clean empty state in xt as well
+            if active_mask is not None:
+                inactive = ~active_mask
+                # Set type dims to noised version of empty_onehot at t_prev
+                abar_tp_val = abar_prev_tp[0, 0, 0].item() if abar_prev_tp.dim() > 0 else 1.0
+                xt_prev_type[0, inactive] = (
+                    torch.sqrt(torch.tensor(abar_tp_val)) * empty_onehot
+                    + torch.sqrt(torch.tensor(1.0 - abar_tp_val)) * torch.randn_like(xt_prev_type[0, inactive])
+                )
+
             xt = torch.cat([xt_prev_geom, xt_prev_type], dim=-1)
 
         # Final x0 prediction from the last xt
@@ -153,6 +185,12 @@ class BubbleSampler:
 
         # Filter out empty slots (last type index = num_room_types)
         empty_idx = self.num_room_types  # index 9
+
+        # Confidence: max non-empty logit minus empty logit
+        non_empty_logits = x0_type[:, :empty_idx]  # (n_slots, num_room_types)
+        empty_logit = x0_type[:, empty_idx]  # (n_slots,)
+        confidence = non_empty_logits.max(dim=-1).values - empty_logit  # (n_slots,)
+
         results = []
         for j in range(n_slots):
             rtype = type_indices[j].item()
@@ -162,6 +200,13 @@ class BubbleSampler:
                     cy[j].item(),
                     radius[j].item(),
                     int(rtype),
+                    confidence[j].item(),
                 ))
 
-        return results
+        # Sort by confidence (highest first), optionally limit count
+        results.sort(key=lambda x: x[4], reverse=True)
+        if max_rooms is not None and len(results) > max_rooms:
+            results = results[:max_rooms]
+
+        # Strip confidence from output
+        return [(cx, cy, r, t) for cx, cy, r, t, _ in results]

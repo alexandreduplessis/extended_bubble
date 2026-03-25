@@ -12,3 +12,5 @@ checkpoints/
 *.pt
 *.pdf
 .claude/
+.venv/
+configs/runtime.yaml

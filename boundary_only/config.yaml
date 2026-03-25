@@ -1,0 +1,35 @@
+data:
+  msd_path: /Data/amine.chraibi/msd
+  cache_dir: /Data/amine.chraibi/msd_preprocessed
+  num_room_types: 9
+  n_max: 135
+  n_boundary_max: 64
+
+model:
+  d_model: 256
+  n_layers: 8
+  n_heads: 8
+  ffn_ratio: 4.0
+  dropout: 0.1
+
+diffusion:
+  num_timesteps: 1000
+  schedule: cosine
+  type_schedule_shift: 1.0
+  prediction: epsilon
+
+training:
+  batch_size: 128
+  lr: 3.0e-4
+  warmup_steps: 500
+  max_steps: 200000
+  save_every: 1000
+  sample_every: 2000
+  cfg_drop_boundary: 0.1
+  type_loss_weight: 1.0
+  grad_clip: 1.0
+  checkpoint_dir: /Data/amine.chraibi/checkpoints_boundary_only
+
+inference:
+  num_steps: 100
+  cfg_scale: 3.0

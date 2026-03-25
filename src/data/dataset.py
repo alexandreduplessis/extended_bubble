@@ -100,7 +100,10 @@ class BubbleDataset(Dataset):
         cx, cy, radii, types = data["cx"], data["cy"], data["radii"], data["types"]
         boundary = data["boundary"]
 
-        bubbles = list(zip(cx.tolist(), cy.tolist(), radii.tolist(), types.tolist()))
+        bubbles = [
+            (float(x), float(y), float(r), int(t))
+            for x, y, r, t in zip(cx, cy, radii, types)
+        ]
         return self._build_tensors(bubbles, boundary, normalize=True)
 
     def _getitem_raw(self, idx: int) -> Dict[str, torch.Tensor]:
@@ -148,9 +151,10 @@ class BubbleDataset(Dataset):
 
         for i in range(n_bubbles):
             cx, cy, r, rt = bubbles[i]
-            bubble_tensor[i, 0] = cx
-            bubble_tensor[i, 1] = cy
-            bubble_tensor[i, 2] = r
+            bubble_tensor[i, 0] = float(cx)
+            bubble_tensor[i, 1] = float(cy)
+            bubble_tensor[i, 2] = float(r)
+            rt = int(rt)
             if 0 <= rt < NUM_ROOM_TYPES:
                 bubble_tensor[i, 3 + rt] = 1.0
             else:

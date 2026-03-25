@@ -3,6 +3,7 @@ import math
 import time
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from pathlib import Path
 import logging
@@ -68,6 +69,8 @@ class BubbleTrainer:
         self.cfg_drop_boundary = tc["cfg_drop_boundary"]
         self.type_loss_weight = tc["type_loss_weight"]
         self.grad_clip = tc["grad_clip"]
+        self.aux_loss_weight = tc.get("aux_loss_weight", 0.1)
+        self.num_room_types = dc["num_room_types"]
 
         # Dataset
         self.train_dataset = BubbleDataset(
@@ -126,6 +129,64 @@ class BubbleTrainer:
 
         return constraints, constraint_mask, boundary, boundary_mask
 
+    def _compute_aux_loss(
+        self, x0_pred, bubble_mask, boundary, boundary_mask, low_noise_mask
+    ):
+        """Compute auxiliary geometric constraint loss on predicted x0.
+
+        Only applied to batch items with low noise (where x0 prediction is meaningful).
+        Penalizes: overlap between active rooms, rooms outside boundary.
+        """
+        B, N, D = x0_pred.shape
+        total = torch.tensor(0.0, device=self.device)
+        count = 0
+
+        for b in range(B):
+            if not low_noise_mask[b]:
+                continue
+            count += 1
+
+            centers = x0_pred[b, :, :2]  # (N, 2)
+            radii = x0_pred[b, :, 2].clamp(min=0.01)  # (N,)
+            type_logits = x0_pred[b, :, 3:]  # (N, num_types+1)
+
+            # Soft active probability
+            type_probs = F.softmax(type_logits * 5.0, dim=-1)
+            p_active = 1.0 - type_probs[:, -1]  # (N,)
+
+            # --- Overlap loss ---
+            dist = torch.cdist(centers.unsqueeze(0), centers.unsqueeze(0))[0]
+            r_sum = radii.unsqueeze(0) + radii.unsqueeze(1)
+            overlap = F.relu(r_sum - dist)  # positive = overlapping
+            pair_weight = p_active.unsqueeze(0) * p_active.unsqueeze(1)
+            mask = torch.triu(torch.ones(N, N, device=self.device), diagonal=1)
+            overlap_loss = (overlap * pair_weight * mask).sum() / N
+
+            # --- Boundary loss ---
+            bnd_valid = boundary_mask[b] > 0.5
+            bnd = boundary[b][bnd_valid]  # (M, 2)
+            bnd_loss = torch.tensor(0.0, device=self.device)
+
+            if len(bnd) >= 3:
+                edges = torch.roll(bnd, -1, dims=0) - bnd
+                normals = torch.stack([edges[:, 1], -edges[:, 0]], dim=-1)
+                normals = normals / (normals.norm(dim=-1, keepdim=True) + 1e-8)
+                signed_area = (bnd[:, 0] * torch.roll(bnd[:, 1], -1) -
+                               torch.roll(bnd[:, 0], -1) * bnd[:, 1]).sum()
+                if signed_area < 0:
+                    normals = -normals
+
+                diff = centers.unsqueeze(1) - bnd.unsqueeze(0)  # (N, M, 2)
+                signed_dist = (diff * normals.unsqueeze(0)).sum(dim=-1)  # (N, M)
+                violation = F.relu(-signed_dist).max(dim=-1).values  # (N,)
+                bnd_loss = (violation * p_active).sum() / N
+
+            total = total + overlap_loss + bnd_loss
+
+        if count > 0:
+            total = total / count
+        return total
+
     def train_step(self, batch: dict) -> dict:
         """Run a single training step.
 
@@ -163,12 +224,27 @@ class BubbleTrainer:
         geom_error = (pred_noise[..., :3] - noise[..., :3]) ** 2
         geom_loss = (geom_error * bubble_mask.unsqueeze(-1)).sum() / bubble_mask.sum().clamp(min=1) / 3
 
-        # Type dims: always active (model must predict empty type noise too)
-        type_error = (pred_noise[..., 3:] - noise[..., 3:]) ** 2
+        # Type dims: only at low noise (t < T/2) where type signal is still present
+        type_error = (pred_noise[..., 3:] - noise[..., 3:]) ** 2  # (B, N, type_dims)
         n_type_dims = self.slot_dim - 3
-        type_loss = type_error.sum() / (B * pred_noise.shape[1] * n_type_dims)
+        N = pred_noise.shape[1]
+        type_low_noise = (t < self.diffusion.num_timesteps // 2).float()  # (B,)
+        # Per-sample type loss, masked to low-noise timesteps
+        type_per_sample = type_error.sum(dim=(1, 2)) / (N * n_type_dims)  # (B,)
+        type_loss = (type_per_sample * type_low_noise).sum() / type_low_noise.sum().clamp(min=1)
 
         loss = geom_loss + self.type_loss_weight * type_loss
+
+        # Auxiliary constraint loss on predicted x0 (only at low noise levels)
+        aux_loss = torch.tensor(0.0, device=self.device)
+        if self.aux_loss_weight > 0:
+            low_noise = t < (self.diffusion.num_timesteps // 2)
+            if low_noise.any():
+                x0_pred = self.diffusion.predict_x0_from_noise(xt, t, pred_noise)
+                aux_loss = self._compute_aux_loss(
+                    x0_pred, bubble_mask, boundary, boundary_mask, low_noise
+                )
+                loss = loss + self.aux_loss_weight * aux_loss
 
         # Update
         self.optimizer.zero_grad()
@@ -188,6 +264,7 @@ class BubbleTrainer:
             "loss": loss.item(),
             "geom_loss": geom_loss.item(),
             "type_loss": type_loss.item(),
+            "aux_loss": aux_loss.item() if torch.is_tensor(aux_loss) else aux_loss,
             "lr": lr,
         }
 
@@ -277,6 +354,7 @@ class BubbleTrainer:
                 f"Step {step}: loss={metrics['loss']:.4f} "
                 f"geom={metrics['geom_loss']:.4f} "
                 f"type={metrics['type_loss']:.4f} "
+                f"aux={metrics['aux_loss']:.4f} "
                 f"lr={metrics['lr']:.6f} "
                 f"dt={step_time:.2f}s"
             )
